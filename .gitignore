@@ -1,0 +1,21 @@
+# Rust build artifacts
+/shadow/target/
+target/
+
+# Shadow VCS runtime state
+.shadow/
+.shadow-workspaces/
+.shadow-staging/
+.shadow-artifacts/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
+/shadow/target/
+target/
+.shadow/
+.shadow-workspaces/
+.shadow-staging/
+.shadow-artifacts/
