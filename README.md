@@ -1,146 +1,174 @@
-# Shadow VCS
+# Shadow
 
-A high-performance, OS-native version control and workspace orchestration engine built on filesystem copy-on-write (CoW) reflinks. Shadow provides isolated development workspaces that share filesystem blocks, fast branching, checkpointing, and atomic merges.
+A high-performance, OS-native version control and workspace orchestration engine built for human developers and autonomous AI agent swarms.
 
-## Features
+Shadow is an ultra-fast version control engine leveraging operating system Copy-on-Write (CoW) reflinks (`FICLONE` `ioctl` on Linux, `clonefile` on APFS) to spawn isolated development sandboxes in sub-milliseconds with zero initial disk footprint.
 
-- **Copy-on-Write Workspaces**: Creates isolated workspaces using `FICLONE` reflinks on btrfs/XFS (falls back to copies when unsupported)
-- **Fast Creation**: Near-instant workspace creation by sharing unchanged files
-- **Lineage Tracking**: Parent-child relationships between workspaces
-- **Three-way Merging**: Diff3-based merging with Git-compatible conflict markers
-- **Integration Merges**: Merge two workspaces into a new combined workspace
-- **Atomic Promotions**: Merge workspace changes back to root atomically
-- **Heartbeat Monitoring**: Detects abandoned/stale workspaces
-- **Checkpoint System**: Commit snapshots with history tracking
+---
 
-## Requirements
+## Key Features
 
-- Linux with `clone3`/`FICLONE` support for native CoW (recommended: btrfs, XFS)
-- Rust 1.70+ (stable)
+- **Copy-on-Write Workspaces**: Instant physical directories via kernel reflink cloning. Storage starts at 0 bytes and grows incrementally per write.
+- **Interactive Subshell Checkout**: `shadow checkout <name>` spawns an interactive shell locked inside the workspace directory. Type `exit` to return to the root.
+- **Dual Merge Architecture**:
+  - **Root Promotion**: Squashed HEAD promotion back to project root `main` via atomic staging swaps (`std::fs::rename`).
+  - **Integration Merges**: Combine two finished agent workspaces into a brand-new, isolated integration sandbox (`shadow merge ws1 ws2 --out combined`).
+- **Surgical Conflict Engine**:
+  - Automatic `diff3` hunk merging for non-overlapping changes.
+  - Injects standard Git-compatible conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) for native IDE UI support.
+  - Outputs machine-readable `.shadow/conflicts.json` manifests for headless AI agent parsing.
+  - Provides TTY line-targeting to jump directly to conflicting lines in your editor (e.g., `code --goto file:line`).
+- **Liveness Heartbeats**: `.shadow-lock` timestamp tracking eliminates raw PID-reuse risks when pruning abandoned workspaces.
+- **Embedded Metadata**: Backed by `redb` for atomic transactions and concurrent thread safety.
+
+---
+
+## System Requirements
+
+- **Operating System**: 
+  - **Linux**: Kernel 4.5+ with `FICLONE` support (recommended: Btrfs, XFS).
+- **Rust Toolchain**: Rust 1.70+ (stable).
+
+---
 
 ## Installation
 
-### Build from source
+### Build from Source (Cargo)
 
 ```bash
+git clone https://github.com/your-username/shadow.git
 cd shadow
 cargo build --release
 cp target/release/shadow ~/.local/bin/
 ```
 
-Or using Makefile:
+### Build via Makefile
 
 ```bash
 make build
 make install
 ```
 
-## Usage
+---
 
-### Initialize in a project
+## Quick Start Guide
 
+### 1. Initialize Project
 ```bash
 cd /path/to/project
 shadow init
 ```
 
-### Create a workspace
-
+### 2. Create & Enter Workspaces
 ```bash
-shadow new feature-branch
-# or with a parent
-shadow new child --parent feature-branch
+# Spawn a new CoW workspace
+shadow new feature-auth
+
+# Enter interactive subshell
+shadow checkout feature-auth
+# (Run commands, build code, type 'exit' to return to project root)
 ```
 
-### Work in isolation
-
+### 3. Isolated Execution & Checkpoints
 ```bash
-shadow exec feature-branch -- make test
-shadow exec feature-branch -- cargo build
-```
+# Run isolated commands directly from project root
+shadow exec feature-auth -- cargo test
 
-### Check status and differences
-
-```bash
-shadow status
-shadow diff feature-branch
-```
-
-### Create checkpoints
-
-```bash
-# From within a workspace directory or project root
+# Record a checkpoint snapshot
 shadow commit -m "Implemented feature X"
 ```
 
-### View history
-
+### 4. Merge Workflows
 ```bash
-shadow log
-```
+# Promote workspace back to root main
+shadow merge feature-auth
 
-### Merge changes
-
-**Promote workspace to root (squash/merge back):**
-```bash
-shadow merge feature-branch
-```
-
-**Integrate two workspaces into a new one:**
-```bash
+# Combine two workspaces into a new integration sandbox
 shadow merge ws1 ws2 --out combined
 ```
 
-### Switch/enter a workspace (spawns a subshell)
+---
 
-```bash
-shadow checkout feature-branch
+## CLI Reference
+
+| Command | Description |
+| :--- | :--- |
+| `shadow init` | Initialize `.shadow/` metadata store and verify filesystem support. |
+| `shadow new <name>` | Create a new CoW workspace sandbox (optional `--parent <ws>`). |
+| `shadow checkout <name>` | Spawn an interactive terminal subshell inside the workspace directory. |
+| `shadow exec <name> -- <cmd>` | Execute a non-interactive command inside the workspace sandbox. |
+| `shadow status` | Display active workspaces, ages, lineages, and modified file deltas. |
+| `shadow diff <name>` | Perform a fast 3-way file comparison against root `main`. |
+| `shadow commit -m "<msg>"` | Record an internal checkpoint snapshot in the timeline. |
+| `shadow log` | View the internal commit timeline for the workspace. |
+| `shadow merge <source>` | Promotes squashed HEAD state atomically back to project root. |
+| `shadow merge <s> <t> --out <o>` | Combines two workspaces into a new integration sandbox. |
+| `shadow undo` | Roll back the last metadata transaction pointer. |
+| `shadow drop <name>` | Clean up and delete a workspace directory and its metadata. |
+
+---
+
+## Project Architecture
+
+```text
+shadow/
+├── src/
+│   ├── co_w/         # Low-level reflink/copy operations and filesystem detection
+│   ├── engine/       # Workspace lifecycle, discovery, heartbeats, snapshotting
+│   ├── storage/      # Embedded redb metadata store with atomic transaction retry logic
+│   ├── merger/       # Diff3 merging, conflict handling, atomic root staging swaps
+│   └── cli/          # Clap-powered CLI interface and interactive subshell runner
+├── Makefile          # Standard build, test, and installation targets
+└── Cargo.toml        # Workspace dependencies & package metadata
 ```
 
-### Undo last operation
-
-```bash
-shadow undo
-```
-
-### Drop a workspace
-
-```bash
-shadow drop feature-branch
-```
-
-## Architecture
-
-- **`co_w/`**: Low-level reflink/copy operations and filesystem detection
-- **`engine/`**: Workspace lifecycle, discovery, heartbeat, snapshot/diff
-- **`storage/`**: Embedded redb metadata store with retry logic
-- **`merger/`**: Diff3 merging, conflict handling, atomic application
-- **`cli/`**: Command-line interface (clap)
+---
 
 ## Workspace Layout
 
-- `.shadow/` - Engine metadata (redb database)
-- `.shadow-workspaces/` - Isolated workspace directories
-- `.shadow-staging/` - Staging area for atomic merges
-- `.shadow-artifacts/` - Per-workspace build caches (isolated)
+```text
+my-project/
+├── .shadow/             # Engine metadata (redb database & transaction log)
+├── .shadow-workspaces/  # Isolated CoW physical workspace directories
+├── .shadow-staging/     # Staging area for atomic root promotion swaps
+└── .shadow-artifacts/   # Per-workspace isolated build/dependency caches
+```
 
-## Conflict Resolution
+---
+
+## Conflict Resolution Pipeline
 
 When merge conflicts occur, Shadow:
-1. Aborts the merge preserving both sources and target
-2. Writes Git-compatible conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) to staged files
-3. Generates `.shadow/conflicts.json` with machine-readable conflict metadata
-4. Suggests editor commands (e.g., `code --goto file:line`) when in a TTY
+1. **Aborts Merge**: Preserves both source and target environments to prevent corruption.
+2. **Injects Markers**: Writes standard Git-compatible conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) into target files for native IDE plugin compatibility.
+3. **Generates Manifest**: Writes `.shadow/conflicts.json` with machine-readable hunk line ranges for headless AI agents.
+4. **TTY Editor Targets**: Suggests precise editor commands (e.g., `code --goto file:line`) when executed in an interactive terminal.
 
-Resolve conflicts in the staged files, then re-attempt the merge.
+*Resolve conflicts in the staged files, then re-attempt the merge command.*
+
+---
 
 ## Testing
 
 ```bash
+# Run unit tests
 cargo test
+
+# Run integration tests
 cargo test --test integration
 ```
 
+---
+
 ## License
 
-See repository for license details.
+Dual-licensed under either of:
+
+- **MIT License** (`LICENSE-MIT`)
+- **Apache License, Version 2.0** (`LICENSE-APACHE`)
+
+at your option.
+
+Copyright (c) 2026 Abhiruk Perera.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

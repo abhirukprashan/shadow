@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Embedded `redb` metadata store.
 //!
 //! All durable shadow state (workspaces, internal commits and the operation

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Line-level three-way (diff3) merging with Git-compatible conflict markers.
 //!
 //! Given a shared `base` and two derived versions (`ours`, `theirs`) the merge

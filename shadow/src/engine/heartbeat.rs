@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Workspace liveness tracking via timestamp heartbeats.
 //!
 //! Raw OS PIDs are deliberately avoided (PID-reuse traps). Instead each active

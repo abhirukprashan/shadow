@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Low-level copy-on-write reflink primitives and filesystem probing.
 //!
 //! On Linux we use the `FICLONE` ioctl, which is supported by CoW filesystems

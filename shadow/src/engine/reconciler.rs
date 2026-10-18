@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Failsafe state reconciliation between the metadata store and the physical
 //! workspace directory.
 //!

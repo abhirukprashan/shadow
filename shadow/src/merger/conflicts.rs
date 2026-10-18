@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Merge orchestration for both merge modes.
 //!
 //! * **Promotion** (`shadow merge <ws>`): squash the workspace HEAD state into

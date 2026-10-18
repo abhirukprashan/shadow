@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! End-to-end integration tests exercising the public `shadow` API across
 //! workspace creation, diffing, conflict detection and atomic merging.
 

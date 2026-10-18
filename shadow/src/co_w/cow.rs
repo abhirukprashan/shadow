@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 //! Recursive workspace materialisation built on top of the reflink primitives.
 
 use crate::co_w::fs_utils::{self, CowStrategy};

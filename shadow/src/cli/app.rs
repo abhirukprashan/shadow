@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Shadow VCS - High performance CoW workspace orchestration", long_about = None)]
+#[command(author, version, about = "Shadow - High performance CoW workspace orchestration", long_about = None)]
 pub struct App {
     #[command(subcommand)]
     pub command: Commands,

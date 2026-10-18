@@ -1,5 +1,8 @@
-//! Shadow VCS - a high-performance, OS-native version control and workspace
-//! orchestration engine built on filesystem copy-on-write (CoW) reflinks.
+// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// Copyright (c) 2026 Abhiruk Perera
+
+//! Shadow - a high-performance, OS-native copy-on-write (CoW) workspace
+//! orchestration engine built on filesystem reflinks.
 //!
 //! The crate is split into focused modules:
 //! - [`co_w`]: low-level copy-on-write reflink primitives and filesystem probes.
