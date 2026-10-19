@@ -277,3 +277,72 @@ fn heartbeat_marks_abandoned_workspace() {
     fs::remove_file(Path::new(&ws.path).join(".shadow-lock")).unwrap();
     assert!(!engine.is_alive(&ws));
 }
+
+#[test]
+fn promotion_rejects_traversing_manifest_keys() {
+    let proj = project(&[("a.txt", "a")]);
+    let engine = Engine::open(proj.path()).unwrap();
+    let ws = engine.create("dev", None).unwrap();
+    fs::write(Path::new(&ws.path).join("a.txt"), "changed").unwrap();
+
+    // Pretend the workspace came from someone else. The baseline manifest is
+    // a plain file, so an attacker can slip `../PWNED.txt` into it.
+    let manifest_path = Path::new(&ws.path).join(".shadow-baseline.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    v["../PWNED.txt"] = serde_json::json!({ "size": 0, "hash": "0".repeat(64) });
+    fs::write(&manifest_path, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    let err = conflicts::promote(&engine, "dev").unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("unsafe path"), "unexpected error: {text}");
+    assert!(!proj.path().join("../PWNED.txt").exists());
+    assert!(!proj.path().join("PWNED.txt").exists());
+}
+
+#[test]
+fn name_traversal_is_rejected() {
+    let proj = project(&[("a.txt", "a")]);
+    let engine = Engine::open(proj.path()).unwrap();
+    assert!(engine.create("../../tmp/evil", None).is_err());
+    assert!(engine.create("a/b", None).is_err());
+    assert!(engine.find("../x").is_err());
+    let escapes = proj
+        .path()
+        .join(".shadow-workspaces")
+        .read_dir()
+        .unwrap()
+        .count();
+    assert_eq!(escapes, 0);
+}
+
+#[test]
+fn promotion_never_follows_workspace_symlinks() {
+    let proj = project(&[("a.txt", "a")]);
+    // A file outside the project that a malicious workspace will try to leak.
+    let secret_dir = tempfile::tempdir().unwrap();
+    let secret = secret_dir.path().join("secret.txt");
+    fs::write(&secret, "TOP SECRET").unwrap();
+
+    let engine = Engine::open(proj.path()).unwrap();
+    let ws = engine.create("dev", None).unwrap();
+    fs::write(Path::new(&ws.path).join("a.txt"), "changed").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&secret, Path::new(&ws.path).join("leak.txt")).unwrap();
+
+    // The manifest walk skips symlinks, so add an entry by hand to force
+    // `leak.txt` into the merge decisions.
+    let manifest_path = Path::new(&ws.path).join(".shadow-baseline.json");
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    v["leak.txt"] = serde_json::json!({ "size": 10, "hash": "x".repeat(64) });
+    fs::write(&manifest_path, serde_json::to_vec(&v).unwrap()).unwrap();
+
+    let report = conflicts::promote(&engine, "dev").unwrap();
+    assert!(report.clean);
+    let leak = proj.path().join("leak.txt");
+    assert!(!leak.exists(), "symlink content was exfiltrated!");
+    if leak.exists() {
+        assert_ne!(fs::read_to_string(&leak).unwrap(), "TOP SECRET");
+    }
+}

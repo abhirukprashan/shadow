@@ -71,7 +71,6 @@ impl Heartbeat {
             .unwrap_or(false)
     }
 
-    /// Last recorded heartbeat timestamp, if any.
     pub fn last_timestamp(&self) -> Option<DateTime<Utc>> {
         let raw = fs::read(&self.path).ok()?;
         serde_json::from_slice::<HeartbeatData>(&raw)
@@ -79,7 +78,6 @@ impl Heartbeat {
             .map(|d| d.timestamp)
     }
 
-    /// Path to the underlying lock file.
     pub fn path(&self) -> &Path {
         &self.path
     }

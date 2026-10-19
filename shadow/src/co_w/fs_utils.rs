@@ -31,7 +31,6 @@ pub enum CowStrategy {
 }
 
 impl CowStrategy {
-    /// Choose a strategy for the given filesystem name.
     pub fn for_fs(fs: &str) -> Self {
         if is_cow_supported_fs(fs) {
             CowStrategy::Reflink
@@ -41,7 +40,6 @@ impl CowStrategy {
     }
 }
 
-/// Filesystems known to support native reflinks.
 pub fn is_cow_supported_fs(fs: &str) -> bool {
     matches!(
         fs.to_ascii_lowercase().as_str(),
@@ -49,7 +47,6 @@ pub fn is_cow_supported_fs(fs: &str) -> bool {
     )
 }
 
-/// Filesystems that definitely lack native reflink support.
 pub fn is_problematic_fs(fs: &str) -> bool {
     matches!(
         fs.to_ascii_lowercase().as_str(),
@@ -143,14 +140,13 @@ mod tests {
                 assert_eq!(std::fs::metadata(&src).unwrap().len(), 1 << 20);
             }
             Err(e) => {
-                let errno = e
-                    .chain()
-                    .find_map(|c| c.downcast_ref::<Errno>())
-                    .copied();
+                let errno = e.chain().find_map(|c| c.downcast_ref::<Errno>()).copied();
                 assert!(
                     matches!(
                         errno,
-                        Some(Errno::EOPNOTSUPP) | Some(Errno::ENOTTY) | Some(Errno::EXDEV)
+                        Some(Errno::EOPNOTSUPP)
+                            | Some(Errno::ENOTTY)
+                            | Some(Errno::EXDEV)
                             | Some(Errno::ENOSYS)
                     ),
                     "reflink failed with an errno that suggests a broken ioctl \

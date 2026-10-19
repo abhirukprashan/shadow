@@ -130,6 +130,7 @@ impl Engine {
     /// is `None`) is materialised via reflinks *and hashed in the same walk*,
     /// so the baseline manifest costs no extra tree traversal.
     pub fn create(&self, name: &str, parent: Option<&str>) -> Result<Workspace> {
+        validate_workspace_name(name)?;
         if self.find(name).is_ok() {
             anyhow::bail!("workspace '{name}' already exists");
         }
@@ -150,22 +151,11 @@ impl Engine {
         // baseline manifest in the same pass (seed `.shadow` dirs are absent
         // from the base, so nothing reserved is copied).
         let mut base_manifest = Manifest::new();
-        cow::materialize_with(
-            &base_dir,
-            &ws_path,
-            self.strategy,
-            |src_file, rel| {
-                let (hash, size) = crate::utils::fs::hash_file(src_file)?;
-                base_manifest.insert(
-                    rel.to_string(),
-                    FileEntry {
-                        size,
-                        hash,
-                    },
-                );
-                Ok(())
-            },
-        )
+        cow::materialize_with(&base_dir, &ws_path, self.strategy, |src_file, rel| {
+            let (hash, size) = crate::utils::fs::hash_file(src_file)?;
+            base_manifest.insert(rel.to_string(), FileEntry { size, hash });
+            Ok(())
+        })
         .with_context(|| format!("materialising workspace '{name}' from base"))?;
 
         // Also keep a reflinked copy of the pristine base tree inside the
@@ -211,8 +201,10 @@ impl Engine {
         self.db.workspaces()
     }
 
-    /// Resolve a workspace by name.
     pub fn find(&self, name: &str) -> Result<Workspace> {
+        // Every name-based command lands here, so checking up front covers
+        // them all in one place.
+        validate_workspace_name(name)?;
         let all = self.db.workspaces()?;
         all.into_iter()
             .filter(|w| w.name == name && w.status == WorkspaceStatus::Active)
@@ -220,7 +212,6 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("workspace '{name}' not found"))
     }
 
-    /// Refresh a workspace's heartbeat by name.
     pub fn touch(&self, name: &str) -> Result<()> {
         let ws = self.find(name)?;
         self.touch_workspace(&ws)
@@ -232,7 +223,6 @@ impl Engine {
         Heartbeat::new(Path::new(&ws.path)).write()
     }
 
-    /// Whether a workspace's heartbeat is still fresh.
     pub fn is_alive(&self, ws: &Workspace) -> bool {
         Heartbeat::new(Path::new(&ws.path)).is_alive()
     }
@@ -341,7 +331,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Append an `undo` marker to the operation log and return it.
     pub fn undo(&self) -> Result<OperationLog> {
         let op = OperationLog {
             id: Uuid::new_v4(),
@@ -402,5 +391,67 @@ impl Engine {
     /// The filesystem name for this project's root (cached at open).
     pub fn fs_name(&self) -> &str {
         &self.fs_name
+    }
+}
+
+/// Workspace names become directory names and DB keys, so a name like
+/// `../x` or `/abs` has to be rejected before it reaches the filesystem.
+pub fn validate_workspace_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !ok {
+        anyhow::bail!(
+            "invalid workspace name '{name}': use 1-64 characters \
+             [A-Za-z0-9._-] starting with a letter or digit (no path \
+             separators, '..', or leading dots)"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_workspace_name;
+
+    #[test]
+    fn accepts_reasonable_names() {
+        for name in ["dev", "feature-auth", "a", "A1", "x_y.z-1", "0ab"] {
+            assert!(
+                validate_workspace_name(name).is_ok(),
+                "should accept {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_and_separators() {
+        for name in [
+            "",
+            "..",
+            ".",
+            "../evil",
+            "../../../../tmp/evil",
+            "a/b",
+            "/abs",
+            ".hidden",
+            "-flag",
+            "_x",
+            "a..b/..",
+            &"x".repeat(65),
+            "with space",
+            "with\nnewline",
+        ] {
+            assert!(
+                validate_workspace_name(name).is_err(),
+                "should reject {name:?}"
+            );
+        }
     }
 }

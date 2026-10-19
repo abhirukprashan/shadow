@@ -25,7 +25,7 @@ pub enum WorkspaceStatus {
 pub struct Workspace {
     pub id: Uuid,
     pub name: String,
-    /// Parent workspace id for stackable (stacked) workspaces.
+    /// Parent workspace id when this workspace is stacked on another.
     pub parent_id: Option<Uuid>,
     /// Physical directory backing this workspace.
     pub path: String,
@@ -36,7 +36,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// Human-readable lineage, e.g. `main -> feature-x`.
     pub fn lineage(&self) -> String {
         self.name.clone()
     }

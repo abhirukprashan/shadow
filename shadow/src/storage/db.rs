@@ -272,8 +272,7 @@ mod tests {
         // inject a closure that always fails deterministically and assert the
         // error surfaces immediately (well under the ~180ms total backoff).
         let started = std::time::Instant::now();
-        let result: Result<()> =
-            db.with_retry(|_| Err(redb::Error::Corrupted("boom".into())));
+        let result: Result<()> = db.with_retry(|_| Err(redb::Error::Corrupted("boom".into())));
         assert!(result.is_err());
         assert!(started.elapsed() < Duration::from_millis(50));
     }

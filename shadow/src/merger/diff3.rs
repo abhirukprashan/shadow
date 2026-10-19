@@ -174,7 +174,6 @@ pub fn conflict_markers<'a>(
     out
 }
 
-/// Perform a three-way line merge.
 pub fn merge_lines<'a>(
     base: &[&'a str],
     ours: &[&'a str],
@@ -401,7 +400,10 @@ mod tests {
     fn split_and_join_round_trip() {
         let content = "a\nb\n\n";
         let lines = split_lines(content);
-        assert_eq!(join_lines(&lines.iter().map(|s| Cow::Borrowed(*s)).collect::<Vec<_>>()), content);
+        assert_eq!(
+            join_lines(&lines.iter().map(|s| Cow::Borrowed(*s)).collect::<Vec<_>>()),
+            content
+        );
         assert!(split_lines("").is_empty());
     }
 }

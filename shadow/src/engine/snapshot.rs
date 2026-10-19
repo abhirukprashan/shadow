@@ -26,7 +26,6 @@ pub struct FileEntry {
     pub hash: String,
 }
 
-/// A snapshot of relative path -> file entry.
 pub type Manifest = BTreeMap<String, FileEntry>;
 
 /// Compute a manifest for the tree rooted at `root`, skipping engine-internal
@@ -84,14 +83,12 @@ pub enum ChangeKind {
     Deleted,
 }
 
-/// A single entry in a diff.
 #[derive(Debug, Clone)]
 pub struct Change {
     pub path: String,
     pub kind: ChangeKind,
 }
 
-/// Diff two manifests, reporting entries that differ between `base` and `other`.
 pub fn diff(base: &Manifest, other: &Manifest) -> Vec<Change> {
     let mut changes = Vec::new();
     for (path, entry) in other {

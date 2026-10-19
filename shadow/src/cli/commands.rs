@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
-//! CLI command implementations.
-
 use crate::cli::app::Commands;
 use crate::engine::heartbeat::Heartbeat;
 use crate::engine::workspace::Engine;
@@ -24,7 +22,6 @@ const WARN_TREE_BYTES: u64 = 1 << 30; // 1 GiB
 /// even when their byte size looks modest.
 const WARN_TREE_FILES: u64 = 50_000;
 
-/// Dispatch a parsed CLI command.
 pub fn handle_command(cmd: Commands) -> Result<()> {
     let cwd = env::current_dir()?;
     // Only `init`/`new` may bootstrap an engine layout in the current
@@ -95,7 +92,6 @@ pub fn shell_path() -> String {
     env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
-/// Build the subshell command used by `shadow checkout`.
 pub fn checkout_command(shell: &str, dir: &Path) -> std::process::Command {
     let mut command = std::process::Command::new(shell);
     command.current_dir(dir);

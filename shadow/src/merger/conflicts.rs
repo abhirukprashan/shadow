@@ -54,7 +54,6 @@ pub struct FileConflict {
     pub hunks: Vec<ConflictHunk>,
 }
 
-/// The outcome of a merge attempt.
 #[derive(Debug, Clone)]
 pub struct MergeReport {
     pub kind: MergeKind,
@@ -81,13 +80,13 @@ enum Decision {
     Conflict(String, Vec<ConflictHunk>, Option<Vec<u8>>),
 }
 
-/// Read a file from a workspace-relative path, returning `None` if absent.
+/// Following a symlink here would let a crafted workspace promote arbitrary
+/// files (say `/etc/passwd`) into the project root, so links count as missing.
 fn read_opt(dir: &Path, rel: &str) -> Result<Option<Vec<u8>>> {
     let path = dir.join(rel);
-    if path.is_file() {
-        Ok(Some(std::fs::read(path)?))
-    } else {
-        Ok(None)
+    match std::fs::symlink_metadata(&path) {
+        Ok(md) if md.file_type().is_file() => Ok(Some(std::fs::read(path)?)),
+        _ => Ok(None),
     }
 }
 
@@ -103,7 +102,6 @@ fn merge_path(
     ours_label: &str,
     theirs_label: &str,
 ) -> Decision {
-    // Deletion handling.
     match ours {
         None => {
             match (base, theirs) {
@@ -235,6 +233,12 @@ fn decisions(
         }
     }
 
+    // Baseline manifests are plain files, so treat every key as hostile
+    // before it touches the filesystem.
+    for p in &paths {
+        merger::sanitize_rel(p)?;
+    }
+
     paths
         .into_par_iter()
         .map(|path| {
@@ -254,19 +258,11 @@ fn decisions(
             } else {
                 read_opt(theirs_dir, &path)?
             };
-            Ok(merge_path(
-                &path,
-                b,
-                o,
-                t,
-                ours_label,
-                theirs_label,
-            ))
+            Ok(merge_path(&path, b, o, t, ours_label, theirs_label))
         })
         .collect()
 }
 
-/// Write a decision's content into `dir` at its relative path.
 fn write_into(dir: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     let target = dir.join(rel);
     if let Some(parent) = target.parent() {

@@ -10,6 +10,30 @@ use walkdir::WalkDir;
 
 use crate::co_w::cow::is_reserved;
 
+/// Manifest keys come from a plain JSON file on disk, so treat them as
+/// hostile until they pass this check.
+pub fn sanitize_rel(rel: &str) -> Result<()> {
+    use std::path::Component;
+
+    let mut normals = 0usize;
+    for comp in Path::new(rel).components() {
+        match comp {
+            Component::Normal(_) => normals += 1,
+            _ => anyhow::bail!(
+                "refusing unsafe path '{rel}': must be a clean relative path \
+                 (no '..', '.', leading '/', or Windows-style prefixes)"
+            ),
+        }
+    }
+    if normals == 0 {
+        anyhow::bail!("refusing unsafe path '{rel}': empty or non-relative");
+    }
+    if is_reserved(Path::new(rel)) {
+        anyhow::bail!("refusing reserved engine path '{rel}'");
+    }
+    Ok(())
+}
+
 /// Copy the tracked contents of `src` into `staging`, skipping engine-internal
 /// files and directories.
 pub fn stage_changes(src: &Path, staging: &Path) -> Result<()> {
@@ -123,8 +147,15 @@ pub fn apply_atomic(staging: &Path, root: &Path) -> Result<usize> {
 pub fn apply_paths(staging: &Path, root: &Path, paths: &[String]) -> Result<usize> {
     let mut applied = 0usize;
     for rel in paths {
+        sanitize_rel(rel)?;
         let source = staging.join(rel);
-        if !source.exists() {
+        // exists() follows symlinks, and a link in staging isn't a file we
+        // want to promote.
+        if !source
+            .symlink_metadata()
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+        {
             continue;
         }
         let target = root.join(rel);
@@ -191,5 +222,25 @@ mod tests {
         fs::write(&repl, b"new").unwrap();
         replace_path(&repl, &target).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new");
+    }
+
+    #[test]
+    fn sanitize_rel_accepts_clean_paths() {
+        assert!(sanitize_rel("a.txt").is_ok());
+        assert!(sanitize_rel("nested/deep/file.rs").is_ok());
+        assert!(sanitize_rel("weird name +1.md").is_ok());
+    }
+
+    #[test]
+    fn sanitize_rel_rejects_traversal_and_reserved() {
+        assert!(sanitize_rel("../escape.txt").is_err());
+        assert!(sanitize_rel("a/../../escape.txt").is_err());
+        assert!(sanitize_rel("/absolute.txt").is_err());
+        assert!(sanitize_rel(".").is_err());
+        assert!(sanitize_rel("..").is_err());
+        assert!(sanitize_rel("").is_err());
+        assert!(sanitize_rel(".shadow/evil").is_err());
+        assert!(sanitize_rel(".shadow-lock").is_err());
+        assert!(sanitize_rel("a/.shadow/x").is_err());
     }
 }
