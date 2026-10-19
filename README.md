@@ -1,8 +1,8 @@
 # Shadow
 
-A high-performance, OS-native version control and workspace orchestration engine built for human developers and autonomous AI agent swarms.
+version control and workspace orchestration engine built for human developers and autonomous AI agents.
 
-Shadow is an ultra-fast version control engine leveraging operating system Copy-on-Write (CoW) reflinks (`FICLONE` `ioctl` on Linux, `clonefile` on APFS) to spawn isolated development sandboxes in sub-milliseconds with zero initial disk footprint.
+Shadow is an ultra-fast version control engine leveraging operating system Copy-on-Write (CoW) reflinks (`FICLONE` `ioctl` on Linux) to spawn isolated development sandboxes in sub-milliseconds with zero initial disk footprint.
 
 ---
 
