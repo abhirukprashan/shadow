@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Merge orchestration for both merge modes.
@@ -13,13 +13,17 @@
 //! automatically; overlapping changes abort the merge, keep the target pristine
 //! and are delivered either to a TTY or as a machine-readable
 //! `.shadow/conflicts.json` manifest.
+//!
+//! Decisions are evaluated in parallel (one task per changed path) and files
+//! whose content is provably identical on both sides (via the manifests'
+//! hashes) are read from disk at most once.
 
+use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::co_w::cow::RESERVED_FILES;
 use crate::engine::snapshot::{self, Manifest};
 use crate::engine::workspace::Engine;
 use crate::merger::diff3::{self, ConflictHunk, MergeOutcome};
@@ -88,11 +92,14 @@ fn read_opt(dir: &Path, rel: &str) -> Result<Option<Vec<u8>>> {
 }
 
 /// Three-way merge of a single path's contents.
+///
+/// Inputs are owned so that the chosen result bytes are *moved* into the
+/// decision instead of being copied again.
 fn merge_path(
     path: &str,
-    base: Option<&[u8]>,
-    ours: Option<&[u8]>,
-    theirs: Option<&[u8]>,
+    base: Option<Vec<u8>>,
+    ours: Option<Vec<u8>>,
+    theirs: Option<Vec<u8>>,
     ours_label: &str,
     theirs_label: &str,
 ) -> Decision {
@@ -104,7 +111,7 @@ fn merge_path(
                 (_, None) => Decision::Delete(path.to_string()),
                 (None, Some(t)) => {
                     // Added on theirs side only.
-                    Decision::Write(path.to_string(), t.to_vec())
+                    Decision::Write(path.to_string(), t)
                 }
                 (Some(b), Some(t)) if b == t => Decision::Delete(path.to_string()),
                 // Deleted on our side but modified on theirs.
@@ -114,60 +121,68 @@ fn merge_path(
         Some(o) => {
             if let Some(t) = theirs {
                 if o == t {
-                    return Decision::Write(path.to_string(), o.to_vec());
+                    return Decision::Write(path.to_string(), o);
                 }
-                if base == Some(o) {
+                if base.as_deref() == Some(o.as_slice()) {
                     // We did not change it; take theirs.
-                    return Decision::Write(path.to_string(), t.to_vec());
+                    return Decision::Write(path.to_string(), t);
                 }
-                if base == Some(t) {
+                if base.as_deref() == Some(t.as_slice()) {
                     // They did not change it; take ours.
-                    return Decision::Write(path.to_string(), o.to_vec());
+                    return Decision::Write(path.to_string(), o);
                 }
 
                 // Both changed differently: attempt a line merge for text.
-                let text_mergeable = diff3::is_text(o)
-                    && diff3::is_text(t)
-                    && base.map(diff3::is_text).unwrap_or(false);
+                let text_mergeable = diff3::is_text(&o)
+                    && diff3::is_text(&t)
+                    && base.as_deref().map(diff3::is_text).unwrap_or(false);
                 if text_mergeable {
-                    let b = base.unwrap_or(&[]);
-                    let base_lines = diff3::split_lines(&String::from_utf8_lossy(b));
-                    let ours_lines = diff3::split_lines(&String::from_utf8_lossy(o));
-                    let theirs_lines = diff3::split_lines(&String::from_utf8_lossy(t));
-                    match diff3::merge_lines(
-                        &base_lines,
-                        &ours_lines,
-                        &theirs_lines,
-                        ours_label,
-                        theirs_label,
+                    // SAFETY-equivalent: `is_text` above proved all three
+                    // buffers are valid UTF-8.
+                    let b = base.as_deref().unwrap_or(&[]);
+                    if let (Ok(bs), Ok(os), Ok(ts)) = (
+                        std::str::from_utf8(b),
+                        std::str::from_utf8(&o),
+                        std::str::from_utf8(&t),
                     ) {
-                        MergeOutcome::Clean(lines) => {
-                            return Decision::Write(
-                                path.to_string(),
-                                diff3::join_lines(&lines).into_bytes(),
-                            );
-                        }
-                        MergeOutcome::Conflicted { lines, conflicts } => {
-                            return Decision::Conflict(
-                                path.to_string(),
-                                conflicts,
-                                Some(diff3::join_lines(&lines).into_bytes()),
-                            );
+                        let base_lines = diff3::split_lines(bs);
+                        let ours_lines = diff3::split_lines(os);
+                        let theirs_lines = diff3::split_lines(ts);
+                        match diff3::merge_lines(
+                            &base_lines,
+                            &ours_lines,
+                            &theirs_lines,
+                            ours_label,
+                            theirs_label,
+                        ) {
+                            MergeOutcome::Clean(lines) => {
+                                return Decision::Write(
+                                    path.to_string(),
+                                    diff3::join_lines(&lines).into_bytes(),
+                                );
+                            }
+                            MergeOutcome::Conflicted { lines, conflicts } => {
+                                return Decision::Conflict(
+                                    path.to_string(),
+                                    conflicts,
+                                    Some(diff3::join_lines(&lines).into_bytes()),
+                                );
+                            }
                         }
                     }
                 }
 
                 // Binary (or non-UTF-8) conflict: keep our bytes for inspection.
-                Decision::Conflict(path.to_string(), binary_hunks(), Some(o.to_vec()))
-            } else if base == Some(o) {
+                Decision::Conflict(path.to_string(), binary_hunks(), Some(o))
+            } else if base.as_deref() == Some(o.as_slice()) {
                 // We did not change it and theirs deleted it: propagate delete.
                 Decision::Delete(path.to_string())
             } else if base.is_none() {
                 // Added only on our side.
-                Decision::Write(path.to_string(), o.to_vec())
+                Decision::Write(path.to_string(), o)
             } else {
                 // Theirs deleted but we modified it.
-                Decision::Conflict(path.to_string(), binary_hunks(), Some(o.to_vec()))
+                Decision::Conflict(path.to_string(), binary_hunks(), Some(o))
             }
         }
     }
@@ -187,7 +202,17 @@ fn binary_hunks() -> Vec<ConflictHunk> {
     }]
 }
 
-/// Evaluate every path that either side changed.
+/// Evaluate every path that the *source* side changed, in parallel.
+///
+/// When `theirs_is_target` is set (promotion), paths changed only on the
+/// theirs/root side are skipped entirely: the outcome would write the root's
+/// own bytes back over itself (or delete an already-absent file), which is a
+/// no-op. This keeps promotion cost proportional to the workspace's changes
+/// rather than to churn on both sides.
+///
+/// Content hashes from the manifests are used to avoid reading a file from
+/// multiple directories when its bytes are provably identical.
+#[allow(clippy::too_many_arguments)] // a paths+manifests bundle would obscure callers more than it helps
 fn decisions(
     base_dir: &Path,
     ours_dir: &Path,
@@ -197,31 +222,48 @@ fn decisions(
     theirs: &Manifest,
     ours_label: &str,
     theirs_label: &str,
+    theirs_is_target: bool,
 ) -> Result<Vec<Decision>> {
     use std::collections::BTreeSet;
     let mut paths: BTreeSet<String> = BTreeSet::new();
     for c in snapshot::diff(base, ours) {
         paths.insert(c.path);
     }
-    for c in snapshot::diff(base, theirs) {
-        paths.insert(c.path);
+    if !theirs_is_target {
+        for c in snapshot::diff(base, theirs) {
+            paths.insert(c.path);
+        }
     }
 
-    let mut out = Vec::new();
-    for path in paths {
-        let b = read_opt(base_dir, &path)?;
-        let o = read_opt(ours_dir, &path)?;
-        let t = read_opt(theirs_dir, &path)?;
-        out.push(merge_path(
-            &path,
-            b.as_deref(),
-            o.as_deref(),
-            t.as_deref(),
-            ours_label,
-            theirs_label,
-        ));
-    }
-    Ok(out)
+    paths
+        .into_par_iter()
+        .map(|path| {
+            let bh = base.get(&path).map(|e| e.hash.as_str());
+            let oh = ours.get(&path).map(|e| e.hash.as_str());
+            let th = theirs.get(&path).map(|e| e.hash.as_str());
+
+            let b = read_opt(base_dir, &path)?;
+            // Same hash on both sides ⇒ same bytes: read once, reuse.
+            let o = if oh == bh {
+                b.clone()
+            } else {
+                read_opt(ours_dir, &path)?
+            };
+            let t = if th == bh {
+                b.clone()
+            } else {
+                read_opt(theirs_dir, &path)?
+            };
+            Ok(merge_path(
+                &path,
+                b,
+                o,
+                t,
+                ours_label,
+                theirs_label,
+            ))
+        })
+        .collect()
 }
 
 /// Write a decision's content into `dir` at its relative path.
@@ -261,6 +303,7 @@ pub fn promote(engine: &Engine, name: &str) -> Result<MergeReport> {
         &theirs,
         name,
         "root",
+        true,
     )?;
 
     let report = finalize(
@@ -272,9 +315,10 @@ pub fn promote(engine: &Engine, name: &str) -> Result<MergeReport> {
         None,
     )?;
 
-    // A fully promoted workspace is consumed; abandoned otherwise.
+    // A fully promoted workspace is consumed: directory reclaimed, record
+    // kept and flagged `Merged` so `shadow status` reports the history.
     if report.clean {
-        engine.finalize_drop(&ws)?;
+        engine.finalize_merged(&ws)?;
     }
     Ok(report)
 }
@@ -358,10 +402,15 @@ fn finalize(
                 .ok_or_else(|| anyhow::anyhow!("integration merge requires --out"))?;
             let out = engine.create(out_name, None)?;
             let out_dir = PathBuf::from(&out.path);
+            // Staging and the workspaces dir share a filesystem: copy bytes
+            // with the kernel instead of round-tripping through this process.
             for path in &write_paths {
                 let staged = staging.join(path);
-                let bytes = std::fs::read(&staged)?;
-                write_into(&out_dir, path, &bytes)?;
+                let target = out_dir.join(path);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&staged, &target)?;
             }
             for rel in &delete_paths {
                 remove_from(&out_dir, rel);
@@ -463,6 +512,7 @@ pub fn integrate(engine: &Engine, first: &str, second: &str, out: &str) -> Resul
         &theirs,
         first,
         second,
+        false,
     )?;
 
     finalize(
@@ -473,17 +523,4 @@ pub fn integrate(engine: &Engine, first: &str, second: &str, out: &str) -> Resul
         out,
         Some(out),
     )
-}
-
-/// Remove a path only if it exists (helper for callers).
-pub fn remove_if_exists(path: &Path) -> Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-/// Reserved files must never be treated as mergeable content.
-pub fn is_reserved_file(name: &str) -> bool {
-    RESERVED_FILES.contains(&name)
 }

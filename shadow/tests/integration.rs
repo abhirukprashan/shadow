@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! End-to-end integration tests exercising the public `shadow` API across
@@ -9,6 +9,7 @@ use std::path::Path;
 
 use shadow::engine::workspace::Engine;
 use shadow::merger::conflicts;
+use shadow::storage::models::WorkspaceStatus;
 
 /// Create a fresh project root containing `files` (relative path -> contents).
 fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
@@ -101,8 +102,33 @@ fn merge_applies_changes_atomically_to_root() {
         fs::read_to_string(proj.path().join("extra.txt")).unwrap(),
         "extra"
     );
-    // Workspace is finalised (removed) after a successful merge.
+    // Workspace is consumed: no longer resolvable, and its directory is gone,
+    // but the metadata record survives flagged `Merged` as project history.
     assert!(engine.find("dev").is_err());
+    assert!(!Path::new(&ws.path).exists());
+    let all = engine.list().unwrap();
+    assert!(
+        all.iter()
+            .any(|w| w.name == "dev" && w.status == WorkspaceStatus::Merged)
+    );
+}
+
+#[test]
+fn reconcile_keeps_merged_records() {
+    let proj = project(&[("a.txt", "a")]);
+    let engine = Engine::open(proj.path()).unwrap();
+    let ws = engine.create("dev", None).unwrap();
+    fs::write(Path::new(&ws.path).join("a.txt"), "merged").unwrap();
+
+    assert!(conflicts::promote(&engine, "dev").unwrap().clean);
+
+    // A merged record has no directory by design; reconciliation must not
+    // mistake it for a ghost and prune it.
+    let report = engine.reconcile().unwrap();
+    assert_eq!(report.pruned, 0);
+    let all = engine.list().unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, WorkspaceStatus::Merged);
 }
 
 #[test]

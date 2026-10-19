@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Low-level copy-on-write reflink primitives and filesystem probing.
@@ -92,24 +92,6 @@ pub fn copy_file(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Clone `src` onto `dst` using `strategy`, falling back to a copy if a reflink
-/// unexpectedly fails. Returns the strategy that succeeded.
-pub fn clone_file(src: &Path, dst: &Path, strategy: CowStrategy) -> Result<CowStrategy> {
-    match strategy {
-        CowStrategy::Reflink => match reflink(src, dst) {
-            Ok(()) => Ok(CowStrategy::Reflink),
-            Err(_) => {
-                copy_file(src, dst)?;
-                Ok(CowStrategy::Copy)
-            }
-        },
-        CowStrategy::Copy => {
-            copy_file(src, dst)?;
-            Ok(CowStrategy::Copy)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,16 +115,5 @@ mod tests {
         std::fs::write(&src, b"hello shadow").unwrap();
         copy_file(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"hello shadow");
-    }
-
-    #[test]
-    fn clone_falls_back_to_copy_without_panicking() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("a.txt");
-        let dst = dir.path().join("b.txt");
-        std::fs::write(&src, b"payload").unwrap();
-        // Copy strategy must always succeed.
-        clone_file(&src, &dst, CowStrategy::Copy).unwrap();
-        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
     }
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Staging and atomic application of workspace changes into the project root.
@@ -8,14 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
-use crate::co_w::cow::{RESERVED_DIRS, RESERVED_FILES};
-
-fn is_reserved(rel: &Path) -> bool {
-    rel.components().any(|c| {
-        RESERVED_DIRS.iter().any(|r| c.as_os_str() == *r)
-            || RESERVED_FILES.iter().any(|r| c.as_os_str() == *r)
-    })
-}
+use crate::co_w::cow::is_reserved;
 
 /// Copy the tracked contents of `src` into `staging`, skipping engine-internal
 /// files and directories.

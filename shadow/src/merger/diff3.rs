@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Line-level three-way (diff3) merging with Git-compatible conflict markers.
@@ -10,8 +10,14 @@
 //! * changes to overlapping ranges are reported as [`ConflictHunk`]s and, when
 //!   materialised, written using standard `<<<<<<<` / `=======` / `>>>>>>>`
 //!   markers so that native IDE merge UIs light up.
+//!
+//! Lines are represented as `&str` slices borrowed from the three input
+//! buffers (output lines are `Cow<str>`), so merging a file performs no
+//! per-line heap allocations — only the final joined output and any conflict
+//! marker lines are ever allocated.
 
 use serde::Serialize;
+use std::borrow::Cow;
 
 /// A conflicting region, expressed as 1-based inclusive line ranges in each of
 /// the three inputs, together with the competing snippets.
@@ -30,23 +36,23 @@ pub struct ConflictHunk {
 
 /// The result of merging one file's lines.
 #[derive(Debug, Clone)]
-pub enum MergeOutcome {
+pub enum MergeOutcome<'a> {
     /// No overlapping changes; the merged lines are conflict-free.
-    Clean(Vec<String>),
+    Clean(Vec<Cow<'a, str>>),
     /// Overlapping changes were found. `lines` contains the merged content with
     /// Git conflict markers already injected.
     Conflicted {
-        lines: Vec<String>,
+        lines: Vec<Cow<'a, str>>,
         conflicts: Vec<ConflictHunk>,
     },
 }
 
-impl MergeOutcome {
+impl<'a> MergeOutcome<'a> {
     pub fn is_clean(&self) -> bool {
         matches!(self, MergeOutcome::Clean(_))
     }
 
-    pub fn into_lines(self) -> Vec<String> {
+    pub fn into_lines(self) -> Vec<Cow<'a, str>> {
         match self {
             MergeOutcome::Clean(lines) => lines,
             MergeOutcome::Conflicted { lines, .. } => lines,
@@ -56,19 +62,19 @@ impl MergeOutcome {
 
 /// A contiguous run of changes from `base` to a derived version.
 #[derive(Debug, Clone)]
-struct Hunk {
+struct Hunk<'a> {
     /// Inclusive start index in `base`.
     base_start: usize,
     /// Exclusive end index in `base` (equals `base_start` for pure insertions).
     base_end: usize,
     /// Replacement lines contributed by the derived version.
-    lines: Vec<String>,
+    lines: Vec<Cow<'a, str>>,
 }
 
-fn diff_hunks(base: &[String], other: &[String]) -> Vec<Hunk> {
-    let mut hunks: Vec<Hunk> = Vec::new();
+fn diff_hunks<'a>(base: &[&'a str], other: &[&'a str]) -> Vec<Hunk<'a>> {
+    let mut hunks: Vec<Hunk<'a>> = Vec::new();
     let mut base_idx = 0usize;
-    let mut current: Option<Hunk> = None;
+    let mut current: Option<Hunk<'a>> = None;
 
     for item in diff::slice(base, other) {
         match item {
@@ -93,7 +99,7 @@ fn diff_hunks(base: &[String], other: &[String]) -> Vec<Hunk> {
                     base_end: base_idx,
                     lines: Vec::new(),
                 });
-                h.lines.push(line.clone());
+                h.lines.push(Cow::Borrowed(*line));
             }
         }
     }
@@ -118,18 +124,23 @@ fn in_cluster(h: &Hunk, start: usize, end: usize, cluster_empty: bool) -> bool {
 
 /// Reconstruct the derived lines for the base range `[start, end)` by applying
 /// `hunks` (which must be ordered and non-overlapping among themselves).
-fn reconstruct(base: &[String], start: usize, end: usize, hunks: &[&Hunk]) -> Vec<String> {
+fn reconstruct<'a>(
+    base: &[&'a str],
+    start: usize,
+    end: usize,
+    hunks: &[&Hunk<'a>],
+) -> Vec<Cow<'a, str>> {
     let mut out = Vec::new();
     let mut pos = start;
     for h in hunks {
         if h.base_start > pos {
-            out.extend_from_slice(&base[pos..h.base_start]);
+            out.extend(base[pos..h.base_start].iter().map(|s| Cow::Borrowed(*s)));
         }
-        out.extend_from_slice(&h.lines);
+        out.extend(h.lines.iter().cloned());
         pos = pos.max(h.base_end);
     }
     if pos < end {
-        out.extend_from_slice(&base[pos..end]);
+        out.extend(base[pos..end].iter().map(|s| Cow::Borrowed(*s)));
     }
     out
 }
@@ -148,33 +159,33 @@ fn project_index(pos: usize, hunks: &[Hunk]) -> usize {
 }
 
 /// Build the Git-style conflict markers for a single conflicting region.
-pub fn conflict_markers(
+pub fn conflict_markers<'a>(
     ours_label: &str,
     theirs_label: &str,
-    ours: &[String],
-    theirs: &[String],
-) -> Vec<String> {
+    ours: &[Cow<'a, str>],
+    theirs: &[Cow<'a, str>],
+) -> Vec<Cow<'a, str>> {
     let mut out = Vec::with_capacity(ours.len() + theirs.len() + 3);
-    out.push(format!("<<<<<<< {ours_label}"));
+    out.push(Cow::Owned(format!("<<<<<<< {ours_label}")));
     out.extend_from_slice(ours);
-    out.push("=======".to_string());
+    out.push(Cow::Owned("=======".to_string()));
     out.extend_from_slice(theirs);
-    out.push(format!(">>>>>>> {theirs_label}"));
+    out.push(Cow::Owned(format!(">>>>>>> {theirs_label}")));
     out
 }
 
 /// Perform a three-way line merge.
-pub fn merge_lines(
-    base: &[String],
-    ours: &[String],
-    theirs: &[String],
+pub fn merge_lines<'a>(
+    base: &[&'a str],
+    ours: &[&'a str],
+    theirs: &[&'a str],
     ours_label: &str,
     theirs_label: &str,
-) -> MergeOutcome {
+) -> MergeOutcome<'a> {
     let ours_hunks = diff_hunks(base, ours);
     let theirs_hunks = diff_hunks(base, theirs);
 
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<Cow<'a, str>> = Vec::new();
     let mut conflicts: Vec<ConflictHunk> = Vec::new();
 
     let (mut oi, mut ti) = (0usize, 0usize);
@@ -193,7 +204,7 @@ pub fn merge_lines(
         let next = next_ours.min(next_theirs).min(n);
 
         if next > pos {
-            out.extend_from_slice(&base[pos..next]);
+            out.extend(base[pos..next].iter().map(|s| Cow::Borrowed(*s)));
             pos = next;
         }
 
@@ -246,9 +257,7 @@ pub fn merge_lines(
 
         if !ours_changed {
             out.extend(theirs_lines);
-        } else if !theirs_changed {
-            out.extend(ours_lines);
-        } else if ours_lines == theirs_lines {
+        } else if !theirs_changed || ours_lines == theirs_lines {
             out.extend(ours_lines);
         } else {
             let base_slice = &base[cluster_start..cluster_end];
@@ -283,7 +292,7 @@ pub fn merge_lines(
     }
 
     if pos < n {
-        out.extend_from_slice(&base[pos..]);
+        out.extend(base[pos..].iter().map(|s| Cow::Borrowed(*s)));
     }
 
     if conflicts.is_empty() {
@@ -302,48 +311,59 @@ pub fn is_text(bytes: &[u8]) -> bool {
 }
 
 /// Split file content into lines in a way that round-trips exactly through
-/// `join("\n")`.
-pub fn split_lines(content: &str) -> Vec<String> {
+/// [`join_lines`]. Borrows from `content` — no allocations.
+pub fn split_lines(content: &str) -> Vec<&str> {
     if content.is_empty() {
         Vec::new()
     } else {
-        content.split('\n').map(|s| s.to_string()).collect()
+        content.split('\n').collect()
     }
 }
 
-/// Join merged lines back into file content.
-pub fn join_lines(lines: &[String]) -> String {
-    lines.join("\n")
+/// Join merged lines back into file content with a single allocation.
+pub fn join_lines(lines: &[Cow<'_, str>]) -> String {
+    let mut total = 0usize;
+    for l in lines {
+        total += l.len() + 1;
+    }
+    let mut out = String::with_capacity(total.saturating_sub(1));
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(l);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn s(v: &[&str]) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
+    fn joined(lines: &[Cow<'_, str>]) -> String {
+        join_lines(lines)
     }
 
     #[test]
     fn non_overlapping_changes_auto_merge() {
-        let base = s(&["a", "b", "c", "d", "e"]);
-        let ours = s(&["A", "b", "c", "d", "e"]);
-        let theirs = s(&["a", "b", "c", "d", "E"]);
+        let base = ["a", "b", "c", "d", "e"];
+        let ours = ["A", "b", "c", "d", "e"];
+        let theirs = ["a", "b", "c", "d", "E"];
         match merge_lines(&base, &ours, &theirs, "ours", "theirs") {
-            MergeOutcome::Clean(lines) => assert_eq!(lines, s(&["A", "b", "c", "d", "E"])),
+            MergeOutcome::Clean(lines) => assert_eq!(joined(&lines), "A\nb\nc\nd\nE"),
             other => panic!("expected clean merge, got {other:?}"),
         }
     }
 
     #[test]
     fn overlapping_changes_conflict_with_markers() {
-        let base = s(&["a", "b", "c"]);
-        let ours = s(&["a", "OURS", "c"]);
-        let theirs = s(&["a", "THEIRS", "c"]);
+        let base = ["a", "b", "c"];
+        let ours = ["a", "OURS", "c"];
+        let theirs = ["a", "THEIRS", "c"];
         match merge_lines(&base, &ours, &theirs, "ws", "main") {
             MergeOutcome::Conflicted { lines, conflicts } => {
                 assert_eq!(conflicts.len(), 1);
-                let joined = lines.join("\n");
+                let joined = joined(&lines);
                 assert!(joined.contains("<<<<<<< ws"));
                 assert!(joined.contains("======="));
                 assert!(joined.contains(">>>>>>> main"));
@@ -358,22 +378,30 @@ mod tests {
 
     #[test]
     fn identical_changes_do_not_conflict() {
-        let base = s(&["a", "b"]);
-        let ours = s(&["a", "X"]);
-        let theirs = s(&["a", "X"]);
+        let base = ["a", "b"];
+        let ours = ["a", "X"];
+        let theirs = ["a", "X"];
         assert!(merge_lines(&base, &ours, &theirs, "o", "t").is_clean());
     }
 
     #[test]
     fn disjoint_insertions_merge() {
-        let base = s(&["one", "two"]);
-        let ours = s(&["start", "one", "two"]);
-        let theirs = s(&["one", "two", "end"]);
+        let base = ["one", "two"];
+        let ours = ["start", "one", "two"];
+        let theirs = ["one", "two", "end"];
         match merge_lines(&base, &ours, &theirs, "o", "t") {
             MergeOutcome::Clean(lines) => {
-                assert_eq!(lines, s(&["start", "one", "two", "end"]));
+                assert_eq!(joined(&lines), "start\none\ntwo\nend");
             }
             _ => panic!("expected clean merge"),
         }
+    }
+
+    #[test]
+    fn split_and_join_round_trip() {
+        let content = "a\nb\n\n";
+        let lines = split_lines(content);
+        assert_eq!(join_lines(&lines.iter().map(|s| Cow::Borrowed(*s)).collect::<Vec<_>>()), content);
+        assert!(split_lines("").is_empty());
     }
 }

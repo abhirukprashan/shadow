@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 use clap::{Parser, Subcommand};
@@ -19,6 +19,16 @@ pub enum Commands {
         parent: Option<String>,
     },
     Checkout {
+        name: String,
+    },
+    /// Print the workspace directory path (keep-alive: refreshes its heartbeat).
+    ///
+    /// Intended for scripts and agents: `cd "$(shadow path <name>)"`.
+    Path {
+        name: String,
+    },
+    /// Refresh a workspace's heartbeat without entering it.
+    Touch {
         name: String,
     },
     Status,

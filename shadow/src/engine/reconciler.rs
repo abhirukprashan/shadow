@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Failsafe state reconciliation between the metadata store and the physical
@@ -10,6 +10,7 @@
 //! reports any orphans it repaired.
 
 use crate::storage::db::Db;
+use crate::storage::models::WorkspaceStatus;
 use anyhow::Result;
 use std::path::Path;
 
@@ -33,6 +34,11 @@ pub fn reconcile(db: &Db, workspaces_dir: &Path) -> Result<ReconcileReport> {
 
     for ws in known {
         report.inspected += 1;
+        // A `Merged` record intentionally has no directory: the merge
+        // reclaimed it while keeping the row as project history.
+        if ws.status == WorkspaceStatus::Merged {
+            continue;
+        }
         let path = Path::new(&ws.path);
         let alive_on_disk = path.exists();
         if !alive_on_disk {

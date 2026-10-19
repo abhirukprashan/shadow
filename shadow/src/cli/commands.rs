@@ -1,12 +1,15 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! CLI command implementations.
 
 use crate::cli::app::Commands;
+use crate::engine::heartbeat::Heartbeat;
 use crate::engine::workspace::Engine;
+use crate::storage::models::{Workspace, WorkspaceStatus};
 use anyhow::{Context, Result};
 use colored::*;
+use rayon::prelude::*;
 use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -14,12 +17,29 @@ use std::path::Path;
 /// Dispatch a parsed CLI command.
 pub fn handle_command(cmd: Commands) -> Result<()> {
     let cwd = env::current_dir()?;
-    let engine = Engine::open_discovered(&cwd)?;
+    // Only `init`/`new` may bootstrap an engine layout in the current
+    // directory; every other command must find an existing project, so a
+    // stray invocation from e.g. `/tmp` can no longer litter a fresh
+    // `.shadow/` tree into an unrelated directory.
+    let engine = match &cmd {
+        Commands::Init | Commands::New { .. } => Engine::open_discovered(&cwd)?,
+        _ => {
+            let root = Engine::discover(&cwd).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "not inside a shadow project (no .shadow metadata found in this or any \
+                     parent directory); run `shadow init` first"
+                )
+            })?;
+            Engine::open(&root)?
+        }
+    };
 
     match cmd {
         Commands::Init => cmd_init(&engine),
         Commands::New { name, parent } => cmd_new(&engine, &name, parent.as_deref()),
         Commands::Checkout { name } => cmd_checkout(&engine, &name),
+        Commands::Path { name } => cmd_path(&engine, &name),
+        Commands::Touch { name } => cmd_touch(&engine, &name),
         Commands::Status => cmd_status(&engine),
         Commands::Diff { name } => cmd_diff(&engine, &name),
         Commands::Exec { name, cmd } => cmd_exec(&engine, &name, cmd),
@@ -38,7 +58,7 @@ fn cmd_init(engine: &Engine) -> Result<()> {
     println!("  metadata:   {}", engine.db_path().display());
     println!("  filesystem: {fs_name}");
 
-    if crate::co_w::fs_utils::is_problematic_fs(&fs_name) {
+    if crate::co_w::fs_utils::is_problematic_fs(fs_name) {
         println!(
             "  {} filesystem '{}' does not support native CoW reflinks; \
              falling back to copy-based workspaces (\".shadow/staging\")",
@@ -53,7 +73,7 @@ fn cmd_init(engine: &Engine) -> Result<()> {
 
 fn cmd_new(engine: &Engine, name: &str, parent: Option<&str>) -> Result<()> {
     let ws = engine.create(name, parent)?;
-    let lineage = describe_lineage(engine, &ws);
+    let lineage = describe_lineage(&engine.list().unwrap_or_default(), &ws);
     println!("{} created workspace '{}' ({})", "✓".green(), name, lineage);
     println!("  path: {}", ws.path);
     Ok(())
@@ -74,8 +94,22 @@ pub fn checkout_command(shell: &str, dir: &Path) -> std::process::Command {
 
 fn cmd_checkout(engine: &Engine, name: &str) -> Result<()> {
     let ws = engine.find(name)?;
-    engine.touch(name)?;
     let ws_path = Path::new(&ws.path);
+
+    // Non-interactive contexts (scripts, CI, AI agents) cannot use an
+    // interactive subshell: print the path so callers can `cd` themselves,
+    // and keep the workspace heartbeat alive while they work.
+    if !std::io::stdin().is_terminal() {
+        engine.touch_workspace(&ws)?;
+        println!("{}", ws.path);
+        eprintln!(
+            "{} non-interactive checkout: workspace path printed; \
+             heartbeats refresh while you work via `shadow touch '{name}'`",
+            "!".yellow(),
+        );
+        return Ok(());
+    }
+
     let shell = shell_path();
     println!(
         "{} entering workspace '{}' ({}) — type 'exit' to return to the project root",
@@ -83,12 +117,29 @@ fn cmd_checkout(engine: &Engine, name: &str) -> Result<()> {
         name,
         ws_path.display()
     );
+    // Keep the heartbeat fresh for the whole subshell session so long-lived
+    // checkouts never look abandoned.
+    let _guard = Heartbeat::new(ws_path).start_refresher();
     let status = checkout_command(&shell, ws_path)
         .status()
         .with_context(|| format!("failed to spawn shell '{shell}'"))?;
     if !status.success() {
         eprintln!("{} shell exited with status {status}", "!".yellow());
     }
+    Ok(())
+}
+
+fn cmd_path(engine: &Engine, name: &str) -> Result<()> {
+    let ws = engine.find(name)?;
+    // Acting as a keep-alive: every path resolution refreshes the heartbeat,
+    // so scripts/agents that poll `shadow path` keep the workspace active.
+    engine.touch_workspace(&ws)?;
+    println!("{}", ws.path);
+    Ok(())
+}
+
+fn cmd_touch(engine: &Engine, name: &str) -> Result<()> {
+    engine.touch(name)?;
     Ok(())
 }
 
@@ -108,6 +159,24 @@ fn cmd_status(engine: &Engine) -> Result<()> {
         return Ok(());
     }
 
+    // Delta computation hashes every workspace tree: run them in parallel.
+    // Merged workspaces have no directory left, so they skip the walk and
+    // report no delta.
+    let rows: Vec<(Workspace, bool, Option<usize>)> = workspaces
+        .par_iter()
+        .map(|ws| {
+            if ws.status == WorkspaceStatus::Merged {
+                return (ws.clone(), false, None);
+            }
+            let alive = engine.is_alive(ws);
+            let delta = match (engine.baseline(ws), engine.workspace_manifest(ws)) {
+                (Ok(base), Ok(cur)) => crate::engine::snapshot::count_changes(&base, &cur),
+                _ => 0,
+            };
+            (ws.clone(), alive, Some(delta))
+        })
+        .collect();
+
     println!(
         "{:<16} {:<12} {:<10} {:<10} {}",
         "NAME".bold(),
@@ -116,26 +185,19 @@ fn cmd_status(engine: &Engine) -> Result<()> {
         "DELTA".bold(),
         "LINEAGE".bold()
     );
-    for ws in workspaces {
-        let alive = engine.is_alive(&ws);
-        let status = if alive {
-            "active".green().to_string()
-        } else {
-            "abandoned".yellow().to_string()
+    let all = &workspaces;
+    for (ws, alive, delta) in rows {
+        let status = match ws.status {
+            WorkspaceStatus::Merged => "merged".blue().to_string(),
+            _ if alive => "active".green().to_string(),
+            _ => "abandoned".yellow().to_string(),
         };
         let age = humanize_age(ws.created_at);
-        let delta = match (engine.baseline(&ws), engine.workspace_manifest(&ws)) {
-            (Ok(base), Ok(cur)) => crate::engine::snapshot::diff(&base, &cur).len(),
-            _ => 0,
-        };
-        let lineage = describe_lineage(engine, &ws);
+        let lineage = describe_lineage(all, &ws);
+        let delta = delta.map_or_else(|| "-".to_string(), |d| format!("{d} files"));
         println!(
             "{:<16} {:<12} {:<10} {:<10} {}",
-            ws.name,
-            status,
-            age,
-            format!("{delta} files"),
-            lineage
+            ws.name, status, age, delta, lineage
         );
     }
     Ok(())
@@ -163,8 +225,11 @@ fn cmd_diff(engine: &Engine, name: &str) -> Result<()> {
         println!("{} {} ({label})", marker, change.path.bold());
 
         if change.kind == crate::engine::snapshot::ChangeKind::Modified {
-            let old = std::fs::read_to_string(root.join(&change.path)).unwrap_or_default();
-            let new = std::fs::read_to_string(ws_path.join(&change.path)).unwrap_or_default();
+            // Surface read errors instead of silently rendering an empty file.
+            let old = std::fs::read_to_string(root.join(&change.path))
+                .with_context(|| format!("reading root copy of '{}'", change.path))?;
+            let new = std::fs::read_to_string(ws_path.join(&change.path))
+                .with_context(|| format!("reading workspace copy of '{}'", change.path))?;
             print_line_diff(&old, &new);
         }
     }
@@ -176,7 +241,6 @@ fn cmd_exec(engine: &Engine, name: &str, cmd: Vec<String>) -> Result<()> {
         anyhow::bail!("no command specified; usage: shadow exec <name> -- <cmd...>");
     }
     let ws = engine.find(name)?;
-    engine.touch(name)?;
     let ws_path = Path::new(&ws.path);
 
     // Local artifact isolation: keep compiler/test caches inside the workspace.
@@ -192,9 +256,9 @@ fn cmd_exec(engine: &Engine, name: &str, cmd: Vec<String>) -> Result<()> {
     command.env("SHADOW_WORKSPACE", &ws.name);
     command.env("SHADOW_WORKSPACE_PATH", ws_path);
 
-    // Simple heartbeat refresher while the command runs.
-    let hb = crate::engine::heartbeat::Heartbeat::new(ws_path);
-    let _ = hb.beat();
+    // Refresh the heartbeat for the entire command runtime, however long it
+    // runs, so the workspace never flips to "abandoned" mid-build.
+    let _guard = Heartbeat::new(ws_path).start_refresher();
 
     let status = command
         .status()
@@ -322,10 +386,13 @@ fn cmd_undo(engine: &Engine) -> Result<()> {
     Ok(())
 }
 
-fn describe_lineage(engine: &Engine, ws: &crate::storage::models::Workspace) -> String {
+/// Render a workspace's ancestry as `main -> parent -> ... -> name`.
+///
+/// Takes the pre-loaded workspace list so callers looping over many workspaces
+/// don't trigger a full metadata scan per row.
+fn describe_lineage(all: &[Workspace], ws: &Workspace) -> String {
     let mut chain = vec![ws.name.clone()];
     let mut cursor = ws.parent_id;
-    let all = engine.list().unwrap_or_default();
     while let Some(pid) = cursor {
         match all.iter().find(|w| w.id == pid) {
             Some(parent) => {
@@ -353,10 +420,34 @@ fn humanize_age(created: chrono::DateTime<chrono::Utc>) -> String {
     }
 }
 
-/// Print a colorized, git-style line diff using the `diff` crate.
+/// Print a colorized, git-style line diff with 3 lines of context.
+///
+/// Unchanged runs longer than the context window collapse into a `...`
+/// marker instead of flooding the terminal.
 fn print_line_diff(old: &str, new: &str) {
     use diff::Result as DiffResult;
-    for item in diff::lines(old, new) {
+    let items = diff::lines(old, new);
+    let n = items.len();
+
+    // Mark which lines to display: every changed line plus 3 of context.
+    let mut show = vec![false; n];
+    for (i, item) in items.iter().enumerate() {
+        if !matches!(item, DiffResult::Both(..)) {
+            let lo = i.saturating_sub(3);
+            let hi = (i + 4).min(n);
+            show[lo..hi].fill(true);
+        }
+    }
+
+    let mut last_shown: Option<usize> = None;
+    for (i, item) in items.iter().enumerate() {
+        if !show[i] {
+            continue;
+        }
+        if matches!(last_shown, Some(l) if i > l + 1) {
+            println!("  {}", "...".dimmed());
+        }
+        last_shown = Some(i);
         match item {
             DiffResult::Left(l) => println!("{}", format!("- {l}").red()),
             DiffResult::Right(r) => println!("{}", format!("+ {r}").green()),

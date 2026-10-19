@@ -1,10 +1,36 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
-//! Filesystem helpers: type detection and free-space reporting.
+//! Filesystem helpers: type detection, content hashing and free-space reporting.
 
 use anyhow::Result;
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::Path;
+
+/// Chunk size for streaming file reads (keeps peak memory constant regardless
+/// of file size).
+const HASH_CHUNK: usize = 64 * 1024;
+
+/// Stream a file through SHA-256, returning `(hex digest, size in bytes)`.
+///
+/// Unlike a whole-file `fs::read` + hash, this uses constant memory and works
+/// on files much larger than RAM.
+pub fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; HASH_CHUNK];
+    let mut size = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        size += n as u64;
+    }
+    Ok((hex::encode(hasher.finalize()), size))
+}
 
 /// Detect the filesystem name for the volume containing `path`.
 ///
@@ -14,7 +40,7 @@ pub fn detect_fs_name(path: &Path) -> String {
     #[cfg(target_os = "linux")]
     {
         if let Ok(stat) = nix::sys::statfs::statfs(path) {
-            return magic_to_name(stat.filesystem_type().0 as i64);
+            return magic_to_name(stat.filesystem_type().0);
         }
         "unknown".to_string()
     }

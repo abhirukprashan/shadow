@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! The central workspace engine.
@@ -10,7 +10,7 @@
 use crate::co_w::cow::{self, RESERVED_FILES};
 use crate::co_w::fs_utils::CowStrategy;
 use crate::engine::heartbeat::Heartbeat;
-use crate::engine::snapshot::{self, Manifest};
+use crate::engine::snapshot::{self, FileEntry, Manifest};
 use crate::storage::db::Db;
 use crate::storage::models::{Commit, OperationLog, Workspace, WorkspaceStatus};
 use anyhow::{Context, Result};
@@ -33,6 +33,7 @@ pub struct Engine {
     workspaces_dir: PathBuf,
     staging_dir: PathBuf,
     db_path: PathBuf,
+    fs_name: String,
     strategy: CowStrategy,
     db: Db,
 }
@@ -45,11 +46,13 @@ impl Engine {
         let staging_dir = root.join(".shadow/staging");
         let db_path = root.join(".shadow/metadata.redb");
 
+        // Creating the staging dir also creates its `.shadow` parent.
         fs::create_dir_all(&workspaces_dir)?;
         fs::create_dir_all(&staging_dir)?;
-        fs::create_dir_all(root.join(".shadow"))?;
 
-        let strategy = CowStrategy::for_fs(&crate::utils::fs::detect_fs_name(root));
+        // One statfs serves both the strategy probe and diagnostics.
+        let fs_name = crate::utils::fs::detect_fs_name(root);
+        let strategy = CowStrategy::for_fs(&fs_name);
         let db = Db::open(&db_path)?;
 
         Ok(Self {
@@ -57,6 +60,7 @@ impl Engine {
             workspaces_dir,
             staging_dir,
             db_path,
+            fs_name,
             strategy,
             db,
         })
@@ -123,8 +127,8 @@ impl Engine {
     /// Create a new CoW workspace, optionally stacked on `parent`.
     ///
     /// The base tree (the parent workspace, or the project root when `parent`
-    /// is `None`) is materialised via reflinks, a baseline manifest is written
-    /// and a workspace record is persisted.
+    /// is `None`) is materialised via reflinks *and hashed in the same walk*,
+    /// so the baseline manifest costs no extra tree traversal.
     pub fn create(&self, name: &str, parent: Option<&str>) -> Result<Workspace> {
         if self.find(name).is_ok() {
             anyhow::bail!("workspace '{name}' already exists");
@@ -142,10 +146,27 @@ impl Engine {
         let ws_path = self.workspaces_dir.join(Self::dir_name(name, id));
         fs::create_dir_all(&ws_path)?;
 
-        // Materialise the base tree into the workspace (seed `.shadow` dirs are
-        // absent from the base, so nothing reserved is copied).
-        cow::materialize(&base_dir, &ws_path, self.strategy)
-            .with_context(|| format!("materialising workspace '{name}' from base"))?;
+        // Materialise the base tree into the workspace while computing the
+        // baseline manifest in the same pass (seed `.shadow` dirs are absent
+        // from the base, so nothing reserved is copied).
+        let mut base_manifest = Manifest::new();
+        cow::materialize_with(
+            &base_dir,
+            &ws_path,
+            self.strategy,
+            |src_file, rel| {
+                let (hash, size) = crate::utils::fs::hash_file(src_file)?;
+                base_manifest.insert(
+                    rel.to_string(),
+                    FileEntry {
+                        size,
+                        hash,
+                    },
+                );
+                Ok(())
+            },
+        )
+        .with_context(|| format!("materialising workspace '{name}' from base"))?;
 
         // Also keep a reflinked copy of the pristine base tree inside the
         // workspace. This is the merge *base* used for line-level diff3
@@ -154,8 +175,6 @@ impl Engine {
         cow::materialize(&base_dir, &base_snapshot, self.strategy)
             .with_context(|| format!("recording merge base for '{name}'"))?;
 
-        // Record the baseline manifest for 3-way diff/merge.
-        let base_manifest = snapshot::compute(&base_dir)?;
         fs::write(
             ws_path.join(BASELINE_FILE),
             serde_json::to_vec(&base_manifest)?,
@@ -201,11 +220,16 @@ impl Engine {
             .ok_or_else(|| anyhow::anyhow!("workspace '{name}' not found"))
     }
 
-    /// Refresh a workspace's heartbeat.
+    /// Refresh a workspace's heartbeat by name.
     pub fn touch(&self, name: &str) -> Result<()> {
         let ws = self.find(name)?;
-        Heartbeat::new(Path::new(&ws.path)).write()?;
-        Ok(())
+        self.touch_workspace(&ws)
+    }
+
+    /// Refresh a workspace's heartbeat (avoids a second DB lookup when the
+    /// caller already resolved the record).
+    pub fn touch_workspace(&self, ws: &Workspace) -> Result<()> {
+        Heartbeat::new(Path::new(&ws.path)).write()
     }
 
     /// Whether a workspace's heartbeat is still fresh.
@@ -282,24 +306,30 @@ impl Engine {
     ///
     /// Reflink-based children hold independent references to their data, so
     /// deleting a parent never corrupts a child; children are simply detached
-    /// from the dropped parent.
+    /// from the dropped parent. All metadata mutations happen in one atomic
+    /// transaction.
     pub fn drop(&self, name: &str) -> Result<()> {
         let ws = self.find(name)?;
 
         // Detach children (CoW refcounts stay valid; lineage just changes).
-        for mut child in self.db.workspaces()? {
-            if child.parent_id == Some(ws.id) {
+        let detached: Vec<Workspace> = self
+            .db
+            .workspaces()?
+            .into_iter()
+            .filter(|w| w.parent_id == Some(ws.id))
+            .map(|mut child| {
                 child.parent_id = None;
-                self.db.put_workspace(&child)?;
-            }
-        }
+                child
+            })
+            .collect();
 
         let path = PathBuf::from(&ws.path);
         if path.exists() {
             fs::remove_dir_all(&path)
                 .with_context(|| format!("removing workspace directory {}", path.display()))?;
         }
-        self.db.remove_workspace(&ws.id.to_string())?;
+        self.db
+            .apply_workspace_changes(&[ws.id.to_string()], &detached)?;
 
         let op = OperationLog {
             id: Uuid::new_v4(),
@@ -351,18 +381,26 @@ impl Engine {
         Ok(self.staging_dir.clone())
     }
 
-    /// Delete a workspace directory after a successful merge.
-    pub fn finalize_drop(&self, ws: &Workspace) -> Result<()> {
+    /// Finalise a successful merge: reclaim the workspace directory but keep
+    /// the metadata record, flagged `Merged`, so `shadow status` can keep
+    /// reporting the workspace as a consumed member of the project history.
+    ///
+    /// The record survives reconciliation (which otherwise prunes directories
+    /// that vanished) and `find` no longer resolves it, so a merged name is
+    /// inert for checkout/exec/merge while still being visible as history.
+    pub fn finalize_merged(&self, ws: &Workspace) -> Result<()> {
         let path = PathBuf::from(&ws.path);
         if path.exists() {
             fs::remove_dir_all(&path)?;
         }
-        self.db.remove_workspace(&ws.id.to_string())?;
+        let mut merged = ws.clone();
+        merged.status = WorkspaceStatus::Merged;
+        self.db.put_workspace(&merged)?;
         Ok(())
     }
 
-    /// Compute the filesystem name for a root (used only for diagnostics).
-    pub fn fs_name(&self) -> String {
-        crate::utils::fs::detect_fs_name(&self.root)
+    /// The filesystem name for this project's root (cached at open).
+    pub fn fs_name(&self) -> &str {
+        &self.fs_name
     }
 }

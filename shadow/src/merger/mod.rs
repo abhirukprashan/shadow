@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Merge machinery: staging/atomic application, line-level diff3 merging,
@@ -6,4 +6,5 @@
 
 pub mod conflicts;
 pub mod diff3;
+#[allow(clippy::module_inception)] // historical layout: merger::merger holds the primitives
 pub mod merger;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Content manifests used for fast diffing, 3-way comparison and conflict
@@ -10,13 +10,14 @@
 //! "ours" (workspace) and "theirs" (project root).
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use walkdir::WalkDir;
 
-use crate::co_w::cow::{RESERVED_DIRS, RESERVED_FILES};
+use crate::co_w::cow::is_reserved;
+use crate::utils::fs::hash_file;
 
 /// Metadata about a single tracked file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,32 +29,28 @@ pub struct FileEntry {
 /// A snapshot of relative path -> file entry.
 pub type Manifest = BTreeMap<String, FileEntry>;
 
-fn is_reserved(rel: &str) -> bool {
-    let first = rel.split('/').next().unwrap_or(rel);
-    RESERVED_DIRS.contains(&first) || RESERVED_FILES.contains(&first)
-}
-
 /// Compute a manifest for the tree rooted at `root`, skipping engine-internal
 /// files and directories.
+///
+/// The walk collects the file list serially (metadata-bound), then hashes
+/// files in parallel across all cores. Each file is streamed through SHA-256
+/// in 64 KiB chunks, so peak memory stays constant regardless of file size.
 pub fn compute(root: &Path) -> Result<Manifest> {
-    let mut manifest = Manifest::new();
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
     if !root.exists() {
-        return Ok(manifest);
+        return Ok(Manifest::new());
     }
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| {
             // Keep the root; prune reserved subtrees so we never walk the build
-            // tree or engine state.
+            // tree or engine state. `is_reserved` inspects every path component
+            // (directories *and* engine-internal files) allocation-free.
             if e.depth() == 0 {
                 return true;
             }
-            let rel = e.path().strip_prefix(root).unwrap_or(e.path());
-            !RESERVED_DIRS
-                .iter()
-                .any(|r| e.file_name().to_str() == Some(r) && e.file_type().is_dir())
-                && !is_reserved(&rel.to_string_lossy())
+            !is_reserved(e.path().strip_prefix(root).unwrap_or(e.path()))
         })
     {
         let entry = entry?;
@@ -65,22 +62,18 @@ pub fn compute(root: &Path) -> Result<Manifest> {
             Err(_) => continue,
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if is_reserved(&rel_str) {
-            continue;
-        }
-        let bytes = std::fs::read(entry.path())?;
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let hash = hex::encode(hasher.finalize());
-        manifest.insert(
-            rel_str,
-            FileEntry {
-                size: bytes.len() as u64,
-                hash,
-            },
-        );
+        files.push((rel_str, entry.path().to_path_buf()));
     }
-    Ok(manifest)
+
+    let entries = files
+        .par_iter()
+        .map(|(rel, path)| {
+            let (hash, size) = hash_file(path)?;
+            Ok((rel.clone(), FileEntry { size, hash }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(entries.into_iter().collect())
 }
 
 /// The classification of a path between two manifests.
@@ -124,6 +117,20 @@ pub fn diff(base: &Manifest, other: &Manifest) -> Vec<Change> {
     }
     changes.sort_by(|a, b| a.path.cmp(&b.path));
     changes
+}
+
+/// Count the entries that differ between `base` and `other` without building
+/// a [`Change`] vector (used by `shadow status`, which only needs the number).
+pub fn count_changes(base: &Manifest, other: &Manifest) -> usize {
+    let mut count = 0usize;
+    for (path, entry) in other {
+        match base.get(path) {
+            None => count += 1,
+            Some(old) if old.hash != entry.hash => count += 1,
+            _ => {}
+        }
+    }
+    count + base.keys().filter(|p| !other.contains_key(*p)).count()
 }
 
 /// Detect 3-way merge conflicts.
@@ -180,6 +187,25 @@ mod tests {
         assert!(kinds.contains(&(ChangeKind::Modified, "mod.txt")));
         assert!(kinds.contains(&(ChangeKind::Deleted, "gone.txt")));
         assert!(!kinds.iter().any(|(_, p)| *p == "keep.txt"));
+
+        assert_eq!(count_changes(&base, &other), 3);
+        assert_eq!(count_changes(&base, &base), 0);
+    }
+
+    #[test]
+    fn hashes_large_file_with_constant_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        // 5 MiB of non-trivial content exercises the chunked read loop.
+        let chunk: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let mut big = Vec::with_capacity(5 * 1024 * 1024);
+        while big.len() < 5 * 1024 * 1024 {
+            big.extend_from_slice(&chunk);
+        }
+        fs::write(dir.path().join("big.bin"), &big).unwrap();
+
+        let m = compute(dir.path()).unwrap();
+        assert_eq!(m["big.bin"].size, big.len() as u64);
+        assert_eq!(m["big.bin"].hash.len(), 64);
     }
 
     #[test]

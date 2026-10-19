@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: (MIT OR Apache-2.0)
+// SPDX-License-Identifier: GPL-3.0-only
 // Copyright (c) 2026 Abhiruk Perera
 
 //! Recursive workspace materialisation built on top of the reflink primitives.
@@ -27,7 +27,11 @@ pub const RESERVED_DIRS: &[&str] = &[
 /// treated as tracked content.
 pub const RESERVED_FILES: &[&str] = &[".shadow-lock", ".shadow-baseline.json"];
 
-fn is_reserved(rel: &Path) -> bool {
+/// Whether any component of `rel` names an engine-internal directory or file.
+///
+/// Single source of truth for every walk in the engine; allocation-free
+/// (compares `OsStr` components directly).
+pub fn is_reserved(rel: &Path) -> bool {
     rel.components().any(|c| {
         RESERVED_DIRS.iter().any(|r| c.as_os_str() == *r)
             || RESERVED_FILES.iter().any(|r| c.as_os_str() == *r)
@@ -39,10 +43,30 @@ fn is_reserved(rel: &Path) -> bool {
 ///
 /// Returns the number of files materialised and the strategy ultimately used.
 pub fn materialize(src: &Path, dst: &Path, strategy: CowStrategy) -> Result<(usize, CowStrategy)> {
+    materialize_with(src, dst, strategy, |_, _| Ok(()))
+}
+
+/// Like [`materialize`], but invokes `on_file(src_path, rel)` for every copied
+/// file while the tree is being walked.
+///
+/// This lets callers (e.g. `Engine::create`) compute a content manifest in the
+/// *same* pass as the copy, instead of paying for an extra full tree traversal.
+pub fn materialize_with<F>(
+    src: &Path,
+    dst: &Path,
+    strategy: CowStrategy,
+    mut on_file: F,
+) -> Result<(usize, CowStrategy)>
+where
+    F: FnMut(&Path, &str) -> Result<()>,
+{
     std::fs::create_dir_all(dst)?;
     let mut files = 0usize;
     let mut used = strategy;
 
+    // WalkDir yields every directory before its children, so parent targets
+    // always exist by the time a file inside them is copied — no per-file
+    // `create_dir_all` needed.
     for entry in WalkDir::new(src)
         .follow_links(false)
         .into_iter()
@@ -59,17 +83,11 @@ pub fn materialize(src: &Path, dst: &Path, strategy: CowStrategy) -> Result<(usi
             Ok(r) if !r.as_os_str().is_empty() => r,
             _ => continue,
         };
-        if is_reserved(rel) {
-            continue;
-        }
         let target = dst.join(rel);
 
         if entry.file_type().is_dir() {
             std::fs::create_dir_all(&target)?;
         } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
             // Prefer the requested strategy, but degrade per-file if needed.
             if used == CowStrategy::Reflink {
                 match fs_utils::reflink(entry.path(), &target) {
@@ -82,6 +100,8 @@ pub fn materialize(src: &Path, dst: &Path, strategy: CowStrategy) -> Result<(usi
             } else {
                 fs_utils::copy_file(entry.path(), &target)?;
             }
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            on_file(entry.path(), &rel_str)?;
             files += 1;
         }
     }
@@ -117,5 +137,25 @@ mod tests {
         let (count, _) = materialize(&base.path().join("src"), &out, CowStrategy::Copy).unwrap();
         assert_eq!(count, 1);
         assert!(!out.join(".shadow").exists());
+    }
+
+    #[test]
+    fn materialize_with_reports_each_file() {
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"a").unwrap();
+        std::fs::write(src.join("b.txt"), b"b").unwrap();
+
+        let out = base.path().join("out");
+        let mut seen = Vec::new();
+        let (count, _) = materialize_with(&src, &out, CowStrategy::Copy, |_, rel| {
+            seen.push(rel.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 2);
+        seen.sort();
+        assert_eq!(seen, vec!["a.txt".to_string(), "b.txt".to_string()]);
     }
 }

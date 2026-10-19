@@ -95,13 +95,15 @@ shadow merge ws1 ws2 --out combined
 | :--- | :--- |
 | `shadow init` | Initialize `.shadow/` metadata store and verify filesystem support. |
 | `shadow new <name>` | Create a new CoW workspace sandbox (optional `--parent <ws>`). |
-| `shadow checkout <name>` | Spawn an interactive terminal subshell inside the workspace directory. |
+| `shadow checkout <name>` | Spawn an interactive terminal subshell inside the workspace directory. In non-interactive contexts (scripts/agents) prints the workspace path instead. |
+| `shadow path <name>` | Print the workspace directory path; also refreshes its heartbeat (keep-alive). Ideal for `cd "$(shadow path <name>)"`. |
+| `shadow touch <name>` | Refresh a workspace's heartbeat without entering it. |
 | `shadow exec <name> -- <cmd>` | Execute a non-interactive command inside the workspace sandbox. |
-| `shadow status` | Display active workspaces, ages, lineages, and modified file deltas. |
+| `shadow status` | Display workspaces, ages, lineages, and modified file deltas (statuses: `active`, `abandoned`, `merged`). |
 | `shadow diff <name>` | Perform a fast 3-way file comparison against root `main`. |
 | `shadow commit -m "<msg>"` | Record an internal checkpoint snapshot in the timeline. |
 | `shadow log` | View the internal commit timeline for the workspace. |
-| `shadow merge <source>` | Promotes squashed HEAD state atomically back to project root. |
+| `shadow merge <source>` | Promotes squashed HEAD state atomically back to project root. The workspace directory is reclaimed and its record stays listed as `merged`. |
 | `shadow merge <s> <t> --out <o>` | Combines two workspaces into a new integration sandbox. |
 | `shadow undo` | Roll back the last metadata transaction pointer. |
 | `shadow drop <name>` | Clean up and delete a workspace directory and its metadata. |
@@ -162,13 +164,6 @@ cargo test --test integration
 
 ## License
 
-Dual-licensed under either of:
-
-- **MIT License** (`LICENSE-MIT`)
-- **Apache License, Version 2.0** (`LICENSE-APACHE`)
-
-at your option.
+Licensed under the GNU General Public License v3.0 only (GPL-3.0-only). See `LICENSE` for details.
 
 Copyright (c) 2026 Abhiruk Perera.
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
