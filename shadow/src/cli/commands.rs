@@ -14,6 +14,16 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
 
+/// Warn when creating a workspace would clone more than this many bytes.
+/// Reflink filesystems share blocks (cheap), but copy-fallback filesystems
+/// pay the full cost — plus a pristine baseline copy — per workspace.
+const WARN_TREE_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Warn when creating a workspace would clone more than this many files.
+/// Tiny-file trees (e.g. huge `src/` checkouts) are slow to walk and copy
+/// even when their byte size looks modest.
+const WARN_TREE_FILES: u64 = 50_000;
+
 /// Dispatch a parsed CLI command.
 pub fn handle_command(cmd: Commands) -> Result<()> {
     let cwd = env::current_dir()?;
@@ -72,6 +82,7 @@ fn cmd_init(engine: &Engine) -> Result<()> {
 }
 
 fn cmd_new(engine: &Engine, name: &str, parent: Option<&str>) -> Result<()> {
+    warn_if_large(engine);
     let ws = engine.create(name, parent)?;
     let lineage = describe_lineage(&engine.list().unwrap_or_default(), &ws);
     println!("{} created workspace '{}' ({})", "✓".green(), name, lineage);
@@ -301,6 +312,7 @@ fn cmd_merge(engine: &Engine, workspaces: &[String], out: Option<&str>) -> Resul
     let report = match (workspaces.len(), out) {
         (1, None) => crate::merger::conflicts::promote(engine, &workspaces[0])?,
         (2, Some(out)) => {
+            warn_if_large(engine);
             crate::merger::conflicts::integrate(engine, &workspaces[0], &workspaces[1], out)?
         }
         (1, Some(_)) => anyhow::bail!("--out requires two source workspaces"),
@@ -407,6 +419,46 @@ fn describe_lineage(all: &[Workspace], ws: &Workspace) -> String {
     chain.join(" -> ")
 }
 
+/// Warn (non-blocking) when the project tree is large enough that cloning it
+/// into a workspace deserves a heads-up.
+///
+/// Uses the exact copy set (`tree_stats` skips everything `materialize`
+/// skips), so the numbers describe the real clone cost. Runs on stderr and
+/// never prompts: script/agent flows stay unattended.
+fn warn_if_large(engine: &Engine) {
+    let Ok((bytes, files)) = crate::co_w::cow::tree_stats(engine.root()) else {
+        return;
+    };
+    if bytes > WARN_TREE_BYTES || files > WARN_TREE_FILES {
+        let cost = if crate::co_w::fs_utils::is_problematic_fs(engine.fs_name()) {
+            "full copies plus a pristine baseline copy per workspace"
+        } else {
+            "cheap CoW reflinks (only edited files cost space)"
+        };
+        eprintln!(
+            "{} large project tree: {} across {files} files — each workspace clones all \
+             of it ({cost}); reserved dirs (.git, target/, node_modules/) are excluded",
+            "!".yellow(),
+            humanize_bytes(bytes),
+        );
+    }
+}
+
+fn humanize_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 fn humanize_age(created: chrono::DateTime<chrono::Utc>) -> String {
     let secs = (chrono::Utc::now() - created).num_seconds().max(0);
     if secs < 60 {
@@ -453,5 +505,20 @@ fn print_line_diff(old: &str, new: &str) {
             DiffResult::Right(r) => println!("{}", format!("+ {r}").green()),
             DiffResult::Both(l, _) => println!("  {l}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::humanize_bytes;
+
+    #[test]
+    fn humanize_bytes_scales() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(1023), "1023 B");
+        assert_eq!(humanize_bytes(1024), "1.0 KiB");
+        assert_eq!(humanize_bytes(1536), "1.5 KiB");
+        assert_eq!(humanize_bytes(3 * 1024 * 1024), "3.0 MiB");
+        assert_eq!(humanize_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
     }
 }

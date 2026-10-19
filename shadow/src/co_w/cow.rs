@@ -109,6 +109,34 @@ where
     Ok((files, used))
 }
 
+/// Aggregate size of the tree [`materialize`] would copy.
+///
+/// Uses the exact same reserved-directory pruning as the copy walk, so the
+/// numbers describe the real clone cost: engine state, `.git`, `target/`,
+/// `node_modules/` etc. never count because they are never copied. Returns
+/// `(bytes, files)`.
+pub fn tree_stats(src: &Path) -> Result<(u64, u64)> {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for entry in WalkDir::new(src)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            !is_reserved(e.path().strip_prefix(src).unwrap_or(e.path()))
+        })
+    {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            files += 1;
+            bytes += entry.metadata()?.len();
+        }
+    }
+    Ok((bytes, files))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +185,22 @@ mod tests {
         assert_eq!(count, 2);
         seen.sort();
         assert_eq!(seen, vec!["a.txt".to_string(), "b.txt".to_string()]);
+    }
+
+    #[test]
+    fn tree_stats_matches_copy_set_and_sums_sizes() {
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(src.join("target")).unwrap();
+        std::fs::create_dir_all(src.join(".git")).unwrap();
+        std::fs::write(src.join("a.txt"), b"12345").unwrap();
+        std::fs::write(src.join("sub/b.txt"), b"abc").unwrap();
+        std::fs::write(src.join("target/big.o"), b"should be ignored").unwrap();
+        std::fs::write(src.join(".git/config"), b"ignored").unwrap();
+
+        let (bytes, files) = tree_stats(&src).unwrap();
+        assert_eq!(files, 2);
+        assert_eq!(bytes, 8);
     }
 }

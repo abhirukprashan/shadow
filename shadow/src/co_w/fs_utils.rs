@@ -7,16 +7,19 @@
 //! such as Btrfs and XFS. When unsupported (Ext4/NTFS/FAT32/…) the caller falls
 //! back to a byte copy so the engine never panics.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 #[cfg(target_os = "linux")]
-use nix::ioctl_readwrite;
+use nix::ioctl_write_int;
 
-// `FICLONE` (`_IOW(0x94, 9, int)`) — clone the file referenced by the source
-// fd onto the destination fd.
+// `FICLONE` (`_IOW(0x94, 9, int)`): the ioctl *argument* is the source fd
+// passed **by value** (`ioctl(dst_fd, FICLONE, src_fd)`), not a pointer —
+// `ioctl_write_int!` is the matching nix variant. (`ioctl_readwrite!` would
+// pass `&mut fd`, which the kernel misinterprets as an fd number and rejects
+// with EBADF, silently degrading every clone to a full copy.)
 #[cfg(target_os = "linux")]
-ioctl_readwrite!(ficlone, 0x94, 9, libc::c_int);
+ioctl_write_int!(ficlone, 0x94, 9);
 
 /// Strategy used when materialising a workspace from its base.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,10 +72,11 @@ pub fn reflink(src: &Path, dst: &Path) -> Result<()> {
         .write(true)
         .truncate(true)
         .open(dst)?;
-    let mut src_fd = source.as_raw_fd();
-    // SAFETY: `dest` is a valid open fd and `src_fd` points to a valid int.
-    unsafe { ficlone(dest.as_raw_fd(), &mut src_fd) }
-        .map_err(|e| anyhow::anyhow!("FICLONE failed for {}: {e}", src.display()))?;
+    // SAFETY: `dest` is a valid open fd; the source fd is passed by value as
+    // the ioctl argument, exactly as `FICLONE` expects.
+    unsafe { ficlone(dest.as_raw_fd(), source.as_raw_fd() as libc::c_ulong) }
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("FICLONE failed for {}", src.display()))?;
     Ok(())
 }
 
@@ -115,5 +119,44 @@ mod tests {
         std::fs::write(&src, b"hello shadow").unwrap();
         copy_file(&src, &dst).unwrap();
         assert_eq!(std::fs::read(&dst).unwrap(), b"hello shadow");
+    }
+
+    /// Exercise the real `FICLONE` path. On CoW filesystems (btrfs/xfs) this
+    /// must succeed; elsewhere it may only fail with the classic
+    /// "unsupported operation" errnos. Any other errno (notably `EBADF`/`EINVAL`)
+    /// indicates a broken ioctl call shape rather than an unsupporting
+    /// filesystem — that regression silently degraded every workspace to
+    /// full copies, so it must fail the test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reflink_uses_a_correct_ficlone_call() {
+        use nix::errno::Errno;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.bin");
+        let dst = dir.path().join("dst.bin");
+        std::fs::write(&src, vec![7u8; 1 << 20]).unwrap();
+
+        match reflink(&src, &dst) {
+            Ok(()) => {
+                assert_eq!(std::fs::read(&dst).unwrap(), vec![7u8; 1 << 20]);
+                assert_eq!(std::fs::metadata(&src).unwrap().len(), 1 << 20);
+            }
+            Err(e) => {
+                let errno = e
+                    .chain()
+                    .find_map(|c| c.downcast_ref::<Errno>())
+                    .copied();
+                assert!(
+                    matches!(
+                        errno,
+                        Some(Errno::EOPNOTSUPP) | Some(Errno::ENOTTY) | Some(Errno::EXDEV)
+                            | Some(Errno::ENOSYS)
+                    ),
+                    "reflink failed with an errno that suggests a broken ioctl \
+                     (expected only 'filesystem does not support reflink'): {errno:?}: {e:#}"
+                );
+            }
+        }
     }
 }
